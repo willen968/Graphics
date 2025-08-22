@@ -1,0 +1,1166 @@
+---
+title: "Notebook_AutoLoans"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: yes
+  pdf_document:
+    extra_dependencies: natbib,booktabs,lscape,graphicx,amsmath
+    number_sections: yes
+    toc: yes
+  word_document: default
+---
+
+# R Setup
+```{r, setup,include=FALSE}
+
+knitr::opts_knit$set(root.dir='/home/a1psw01/Projects/AutoLoans/Programs/')
+knitr::opts_chunk$set(cache =FALSE,eval=FALSE)
+rm(list=ls())
+require(readr); require(readxl);
+require(tidyr);require(tidyselect)
+require(stringr)
+require(knitr); require(png)
+require(binsreg)
+options(stringsAsFactors=FALSE)
+require(fixest)
+require(modelr)
+require(lubridate)
+require(janitor)
+require(ISOweek)
+require(haven)
+require(zoo)
+library(dplyr)
+require(ggplot2); require(RColorBrewer)
+require(reshape2)
+require(haven)
+require(rfrbbhaver)
+require(odbc)
+require(tictoc)
+require(glue)
+require(purrr)
+
+options(dplyr.width=Inf); options(dplyr.print_max=Inf)
+options(stringsAsFactors=FALSE)
+options(scipen = 999)
+
+ params <- list(
+  path_tg= "../Output/AutoLoans_",
+   path_data =  "../Data"
+  )
+
+  getwd()
+source("/shared/LoewensteinWillen/ResidentialInvestment/dofiles and scripts/fGraphicsFunctionsNew.R")
+source("https://raw.githubusercontent.com/willen968/Graphics/refs/heads/main/fGraphicsFunctions2025.R")
+```
+
+## fTabStat
+
+```{r}
+fTabStat <- function(data, vars, by = NULL, stats = c("mean", "sd", "min", "max"), 
+                    quantiles = NULL, weights = NULL, format = "wide") {
+  # Check if data is a data frame
+  if (!is.data.frame(data)) {
+    stop("Data must be a data frame")
+  }
+  
+  # Check if variables exist in the data
+  if (!all(vars %in% names(data))) {
+    missing_vars <- vars[!vars %in% names(data)]
+    stop(paste("The following variables are not found in the data:", 
+               paste(missing_vars, collapse = ", ")))
+  }
+  
+  # Check if by variable exists in the data (if specified)
+  if (!is.null(by) && !by %in% names(data)) {
+    stop(paste("The by variable", by, "is not found in the data"))
+  }
+  
+  # Check if weights variable exists in the data (if specified)
+  if (!is.null(weights) && !weights %in% names(data)) {
+    stop(paste("The weights variable", weights, "is not found in the data"))
+  }
+  
+  # Convert quantiles to numeric if provided
+  if (!is.null(quantiles)) {
+    quantiles <- as.numeric(quantiles)
+    if (any(quantiles < 0 | quantiles > 1)) {
+      stop("Quantiles must be between 0 and 1")
+    }
+  }
+  
+  # Define available statistics
+  available_stats <- c("mean", "sd", "var", "min", "max", "sum", "count", "n", "nmiss", "cv")
+  
+  # Check if requested statistics are available
+  if (!all(stats %in% available_stats) && !all(grepl("^p[0-9]+$", stats[!stats %in% available_stats]))) {
+    invalid_stats <- stats[!stats %in% available_stats & !grepl("^p[0-9]+$", stats)]
+    stop(paste("The following statistics are not supported:", 
+               paste(invalid_stats, collapse = ", ")))
+  }
+  
+  # Add percentiles to stats if quantiles are provided
+  if (!is.null(quantiles)) {
+    percentile_stats <- paste0("p", quantiles * 100)
+    stats <- unique(c(stats, percentile_stats))
+  }
+  
+  # Extract any percentile stats
+  percentile_stats <- stats[grepl("^p[0-9]+$", stats)]
+  percentile_values <- as.numeric(sub("^p", "", percentile_stats)) / 100
+  regular_stats <- stats[!grepl("^p[0-9]+$", stats)]
+  
+  # Define statistic functions
+  stat_functions <- list(
+    mean = function(x, w = NULL) {
+      if (is.null(w)) return(mean(x, na.rm = TRUE))
+      else return(weighted.mean(x, w, na.rm = TRUE))
+    },
+    sd = function(x, w = NULL) {
+      if (is.null(w)) return(sd(x, na.rm = TRUE))
+      else {
+        # Weighted SD
+        xbar <- weighted.mean(x, w, na.rm = TRUE)
+        sqrt(sum(w * (x - xbar)^2, na.rm = TRUE) / (sum(w, na.rm = TRUE) - 1))
+      }
+    },
+    var = function(x, w = NULL) {
+      if (is.null(w)) return(var(x, na.rm = TRUE))
+      else {
+        # Weighted variance
+        xbar <- weighted.mean(x, w, na.rm = TRUE)
+        sum(w * (x - xbar)^2, na.rm = TRUE) / (sum(w, na.rm = TRUE) - 1)
+      }
+    },
+    min = function(x, w = NULL) min(x, na.rm = TRUE),
+    max = function(x, w = NULL) max(x, na.rm = TRUE),
+    sum = function(x, w = NULL) {
+      if (is.null(w)) return(sum(x, na.rm = TRUE))
+      else return(sum(x * w, na.rm = TRUE))
+    },
+    count = function(x, w = NULL) {
+      if (is.null(w)) return(length(x))
+      else return(sum(w, na.rm = TRUE))
+    },
+    n = function(x, w = NULL) sum(!is.na(x)),
+    nmiss = function(x, w = NULL) sum(is.na(x)),
+    cv = function(x, w = NULL) {
+      # Coefficient of variation
+      if (is.null(w)) {
+        sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE)
+      } else {
+        xbar <- weighted.mean(x, w, na.rm = TRUE)
+        wsd <- sqrt(sum(w * (x - xbar)^2, na.rm = TRUE) / (sum(w, na.rm = TRUE) - 1))
+        return(wsd / xbar)
+      }
+    }
+  )
+  
+  # Function to calculate percentiles
+  weighted_quantile <- function(x, w = NULL, probs = 0.5) {
+    if (is.null(w)) {
+      return(quantile(x, probs = probs, na.rm = TRUE))
+    } else {
+      # Sort by x
+      ord <- order(x)
+      x <- x[ord]
+      w <- w[ord]
+      
+      # Remove NAs
+      valid <- !is.na(x) & !is.na(w)
+      x <- x[valid]
+      w <- w[valid]
+      
+      if (length(x) == 0) return(rep(NA, length(probs)))
+      
+      # Calculate cumulative weights
+      w <- w / sum(w)
+      cum_w <- cumsum(w)
+      
+      result <- numeric(length(probs))
+      for (i in seq_along(probs)) {
+        if (probs[i] <= 0) {
+          result[i] <- min(x)
+        } else if (probs[i] >= 1) {
+          result[i] <- max(x)
+        } else {
+          # Interpolate
+          pos <- which(cum_w >= probs[i])[1]
+          if (pos == 1) {
+            result[i] <- x[1]
+          } else {
+            # Linear interpolation
+            h <- (probs[i] - cum_w[pos-1]) / (cum_w[pos] - cum_w[pos-1])
+            result[i] <- x[pos-1] + h * (x[pos] - x[pos-1])
+          }
+        }
+      }
+      return(result)
+    }
+  }
+  
+  # Initialize result
+  if (is.null(by)) {
+    # Simple tabstat without grouping
+    result <- data.frame(variable = vars, stringsAsFactors = FALSE)
+    
+    # Calculate statistics for each variable
+    for (stat in regular_stats) {
+      if (stat %in% names(stat_functions)) {
+        result[[stat]] <- sapply(vars, function(v) {
+          if (is.null(weights)) {
+            stat_functions[[stat]](data[[v]])
+          } else {
+            stat_functions[[stat]](data[[v]], data[[weights]])
+          }
+        })
+      }
+    }
+    
+    # Calculate percentiles if requested
+    if (length(percentile_stats) > 0) {
+      for (i in seq_along(percentile_values)) {
+        p_stat <- percentile_stats[i]
+        p_value <- percentile_values[i]
+        
+        result[[p_stat]] <- sapply(vars, function(v) {
+          if (is.null(weights)) {
+            weighted_quantile(data[[v]], probs = p_value)
+          } else {
+            weighted_quantile(data[[v]], data[[weights]], probs = p_value)
+          }
+        })
+      }
+    }
+  } else {
+    # Tabstat with grouping
+    by_levels <- unique(data[[by]])
+    results_list <- list()
+    
+    for (level in by_levels) {
+      subset_data <- data[data[[by]] == level, , drop = FALSE]
+      
+      # Initialize result for this group
+      group_result <- data.frame(variable = vars, stringsAsFactors = FALSE)
+      
+      # Calculate statistics for each variable in this group
+      for (stat in regular_stats) {
+        if (stat %in% names(stat_functions)) {
+          group_result[[stat]] <- sapply(vars, function(v) {
+            if (is.null(weights)) {
+              stat_functions[[stat]](subset_data[[v]])
+            } else {
+              stat_functions[[stat]](subset_data[[v]], subset_data[[weights]])
+            }
+          })
+        }
+      }
+      
+      # Calculate percentiles if requested
+      if (length(percentile_stats) > 0) {
+        for (i in seq_along(percentile_values)) {
+          p_stat <- percentile_stats[i]
+          p_value <- percentile_values[i]
+          
+          group_result[[p_stat]] <- sapply(vars, function(v) {
+            if (is.null(weights)) {
+              weighted_quantile(subset_data[[v]], probs = p_value)
+            } else {
+              weighted_quantile(subset_data[[v]], subset_data[[weights]], probs = p_value)
+            }
+          })
+        }
+      }
+      
+      results_list[[as.character(level)]] <- group_result
+    }
+    
+    # Format results based on requested format
+    if (format == "wide") {
+      # Create wide format
+      result <- do.call(rbind, lapply(names(results_list), function(level) {
+        df <- results_list[[level]]
+        df[[by]] <- level  # Use the actual by variable name
+        # Move by column to the first position
+        df <- df[, c(by, setdiff(names(df), by))]
+        return(df)
+      }))
+      rownames(result) <- NULL
+    } else {
+      # Create long format
+      result <- list()
+      for (level in names(results_list)) {
+        result[[level]] <- results_list[[level]]
+      }
+    }
+  }
+  
+  return(result)
+}
+```
+
+# Work Finish Publish
+
+Overview
+
+To replicate, you run 3 and then 2 and then 1.
+
+#  Load in the final matched sample
+
+```{r}
+abs_hmda_sample <- read_csv("/shared/crt/AutoLoans/data/intermediate/abs_hmda_sample.csv") %>%
+  readr::type_convert()
+```
+
+
+# I. Propensity Score Weighting
+
+## Function
+
+```{r}
+# Minimal SSH Runner for R Markdown - With Parameter Support
+
+run_on_node <- function(node_name, 
+                       race_var = "hw", 
+                       sample_type = "primary", 
+                       group_var = "fico620XmfgXsubventionXnew",
+                       memory_limit = "16G") {
+  
+  timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  log_file <- paste0("/home/a1psw01/Projects/AutoLoans/Logs/job_", node_name, "_", timestamp, ".log")
+  
+  # Build command line arguments
+  args <- paste0(
+    "--race_var=", race_var,
+    " --sample_type=", sample_type,
+    " --group_var=", group_var,
+    " --memory_limit=", memory_limit
+  )
+  
+  cmd <- paste0("ssh ", node_name, " '",
+    "source ~/.bashrc && ",
+    "conda activate /shared/venvs/pw_r_2025 && ",
+    "cd /home/a1psw01/Projects/AutoLoans/Programs/ && ",
+    "R_MAX_VSIZE=", memory_limit, " Rscript --vanilla AutoloanPSWScript_modified.R ", args,
+    "' > ", log_file, " 2>&1 &")
+  
+  system(cmd)
+  cat("Job submitted to", node_name, "\n")
+  cat("Parameters: race_var=", race_var, ", sample_type=", sample_type, ", group_var=", group_var, "\n")
+  cat("Log file:", log_file, "\n")
+  
+  return(log_file)
+}
+```
+
+## Run code
+
+```{r}
+log_file <- run_on_node("a1pcmp22", 
+                       race_var = "hw",                       
+                       # Options: "black", "hw"
+                       sample_type = "all",               
+                       # Options: "primary", "all"
+                       group_var = "ficoXmfgXsubventionXnew",  
+                       # Options: "mfgXsubventionXnew", 
+                       #          "ficoXmfgXsubventionXnew", 
+                       #          "fico620XmfgXsubventionXnew", 
+                       #          "fico620Xmfg", 
+                       #          "fico620XmfgXsubvention", 
+                       #          "ficoXmfg", 
+                       #          "ficoXmfgXsubvention"
+                       memory_limit = "64G")                 
+                       # Options: "16G", "32G", "64G"
+```
+
+
+## Generate a file with bins and propensity score weights
+
+These are the examples from David's code:
+
+- `/shared/crt/DZ/Discrimination/scripts/ob_hmda_grid_ps_llpa_nos_locomp_b.do` is an example of the code to compute the PSWs for the mortgage model
+- `ob...` creates `/shared/crt/DZ/Discrimination/output/hmda_ob_ps_llpa_nos_srp_lender_eighths_lo_b.csv`
+- `/shared/crt/DZ/Discrimination/scripts_fsst/dim_fico_ltv_v3.m` is an example of the code that uses the weights to compute differences in menus
+
+### Follow these steps:
+
+1. Wrote a complete program: `/home/home01/a1psw01/Projects/AutoLoans/Programs/AutoloanPSWScript.R`
+2. Then a bash script: `/home/home01/a1psw01/Projects/AutoLoans/Programs/run_analysis.sh`
+3. Then I go to the command line and type `nohup /home/a1psw01/Projects/AutoLoans/Programs/run_analysis.sh &` where nohup means "no hangup" and continues running the program even if I close the terminal
+4. The program generates a log file: `/home/home01/a1psw01/Projects/AutoLoans/Logs/autoloan_$(date +%Y%m%d_%H%M%S).log` in which you can follow the progress of the program
+
+### Load and Process Propensity Score Weights
+
+```{r propensity-score-weights}
+library(readr)
+library(dplyr)
+
+# Set parameters here
+race_var <- "hw"  # Change to "hw" for Hispanic/white analysis
+group_var <- "fico620XmfgXsubventionXnew"
+
+# Load and process data
+input_file <- paste0("/shared/crt/AutoLoans/data/intermediate/", race_var, "_", group_var,"_all","_all_weights.rds")
+weight_col <- paste0(race_var, "_weights")
+
+data_psw <- readRDS(input_file) %>%
+  group_by(ficoXmfgXsubventionXnew) %>%
+  mutate(race_gcount = sum(!!sym(race_var) == 1)) %>%
+  filter(race_gcount > 20) %>%
+  mutate(weight_new = !!sym(weight_col) * race_gcount) %>%
+  ungroup()
+
+# Save detailed data
+detailed_output <- paste0("/shared/crt/AutoLoans/data/output/data_psw_", race_var, "_", group_var,"_all", "_all_weights.csv")
+write_csv(data_psw, detailed_output)
+
+# Create binned data
+race_weight_col <- paste0("weight_new_", race_var)
+white_weight_col <- "weight_new_white"
+
+bins_psw <- data_psw %>%
+  mutate(
+    !!race_weight_col := ifelse(!!sym(race_var) == 1, weight_new, 0),
+    !!white_weight_col := ifelse(!!sym(race_var) == 0, weight_new, 0)
+  ) %>%
+  group_by(fico_grp, new, standardized_manufacturer, has_subvention, rounded_rates, rounded_term) %>%
+  summarise(
+    !!paste0(race_var, "_ct") := sum(!!sym(race_var) == 1),
+    white_ct = sum(!!sym(race_var) == 0),
+    !!paste0(race_var, "_wt") := sum(!!sym(race_weight_col)),
+    white_wt = sum(!!sym(white_weight_col)),
+    .groups = 'drop'
+  )
+
+binned_output <- paste0("/shared/crt/AutoLoans/data/output/bins_psw_", race_var, "_", group_var, "_all","_all_weights.csv")
+write_csv(bins_psw, binned_output)
+
+# Balance table - weighted
+tab_weighted <- fTabStat(data_psw,
+  vars = c("log_loan_amount","obligorCreditScore","ltv","pti","vehicleTypeCode","new","originalInterestRatePercentage","originalLoanTerm"),
+  weights = "weight_new",
+  by = race_var,
+  stats = "mean",
+  quantiles = c(0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99)
+) %>%
+  arrange(variable) %>%
+  mutate(weights = "YES") %>%
+  relocate(weights)
+
+# Balance table - unweighted
+tab_unweighted <- fTabStat(data_psw,
+  vars = c("log_loan_amount","obligorCreditScore","ltv","pti","vehicleTypeCode","new","originalInterestRatePercentage","originalLoanTerm"),
+  by = race_var,
+  stats = "mean",
+  quantiles = c(0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99)
+) %>%
+  arrange(variable) %>%
+  mutate(weights = "NO") %>%
+  relocate(weights)
+
+# Combine balance tables
+balance_table <- bind_rows(tab_unweighted, tab_weighted) %>%
+  arrange(variable, weights)
+
+balance_output <- paste0("/shared/crt/AutoLoans/data/output/balance_table_", race_var, "_", group_var, "_all", ".csv")
+write_csv(balance_table, balance_output)
+
+cat("Processing complete for race_var:", race_var, "\n")
+cat("Files saved:\n")
+cat("- Detailed data:", detailed_output, "\n")
+cat("- Binned data:", binned_output, "\n") 
+cat("- Balance table:", balance_output, "\n")
+```
+
+# II. ABS-CCP Auto Loan Data Merge Analysis
+
+This document loads, deduplicates, and merges ABS auto loan data with CCP credit bureau data, then enriches it with census block demographic data.
+
+## Step 1: ABS Data Loading
+
+```{r data-loading, cache=TRUE}
+# Load and process ABS data (this chunk is cached due to long load time)
+cat("Loading ABS data...\n")
+abs_download <- read_csv("/shared/crt/AutoLoans/data/raw/max_merge/abs_ee_nodup.csv") 
+
+abs <- abs_download %>%
+  mutate(originalLoanAmount = floor(originalLoanAmount)) %>%
+  mutate(reportingPeriodScheduledPaymentAmount = floor(reportingPeriodScheduledPaymentAmount)) %>%
+  mutate(originationDate = as.Date(paste0(substr(originationDate, 4, 7), "/",
+                                         substr(originationDate, 1, 2), "/1"))) %>%
+  mutate(year = year(originationDate),
+         month = month(originationDate),
+         quarter = quarter(originationDate)) %>%
+  mutate(hicredit = originalLoanAmount,
+         state = substr(obligorGeographicLocation, 1, 2)) %>%
+  arrange(assetNumber) %>%
+  filter(is.na(reportingPeriodScheduledPaymentAmount) == FALSE)
+
+cat("Data loaded successfully. Total records:", nrow(abs), "\n")
+```
+
+### 2.1 ABS Duplicate Analysis
+
+```{r abs-duplicate-analysis}
+# Define matching variables for the merge
+matching_vars <- c("year", "month", "originalLoanAmount", "state", "reportingPeriodScheduledPaymentAmount")
+
+# Check for duplicates on matching variables in ABS
+abs_duplicates <- abs %>%
+  group_by(across(all_of(matching_vars))) %>%
+  summarise(
+    n_records = n(),
+    assets = paste(unique(assetNumber), collapse = ", "),
+    asset_types = paste(unique(assetTypeNumber), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_records > 1) %>%
+  arrange(desc(n_records))
+
+# Summary statistics
+cat("=== ABS DUPLICATE ANALYSIS ===\n")
+cat("Total ABS records:", nrow(abs), "\n")
+cat("Duplicate groups:", nrow(abs_duplicates), "\n") 
+cat("Total duplicate records:", sum(abs_duplicates$n_records), "\n")
+cat("Percentage duplicates:", round(sum(abs_duplicates$n_records) / nrow(abs) * 100, 2), "%\n\n")
+
+# Show examples if duplicates exist
+if(nrow(abs_duplicates) > 0) {
+  cat("Largest duplicate groups:\n")
+  print(head(abs_duplicates, 10))
+  
+  # Show duplicate group size distribution
+  duplicate_sizes <- abs_duplicates %>%
+    count(n_records, name = "n_groups") %>%
+    mutate(total_records = n_records * n_groups)
+  
+  cat("\nDuplicate group size distribution:\n")
+  print(duplicate_sizes)
+}
+```
+
+## Step 2: CCP Auto Loan Data Loading
+
+```{r ccp-database-query, cache=TRUE}
+# Connect to database and download CCP auto loan data (cached due to long query time)
+cat("Connecting to RADAR database...\n")
+radar <- dbConnect(odbc::odbc(), 'RADAR')
+
+query = "SELECT cid, qtr, acctno, balance, bankcaptive, dup_cid_flag_d,
+     dup_tlid_flag_d, hicredit, industrycode, lastactivitydate, opendate,
+     pastdue, payment, primary_flag_d, primary_flag_e, riskscore,
+     state, statuscode, term, tlid
+     FROM (
+          SELECT cid,
+          qtr,
+          acctno,
+          balance,
+          bankcaptive,
+          dup_cid_flag_d,
+          dup_tlid_flag_d,
+          hicredit,
+          industrycode,
+          lastactivitydate,
+          opendate,
+          pastdue,
+          payment,
+          primary_flag_d,
+          riskscore,
+          state,
+          statuscode,
+          term,
+          tlid,
+          ROW_NUMBER() OVER (PARTITION BY tlid ORDER BY qtr ASC) AS row_num
+          FROM concredit.view_autoloans
+                    WHERE (opendate >= '2017-01-01'
+          AND opendate <= '2023-12-01'
+          AND rand_no_cid <1000
+          AND qtr >= '2017-03-01'
+          AND qtr <= '2023-12-01'
+          /* 
+          AND primary_flag_d = '1'
+          */
+          )
+     ) AS ranked_data
+     WHERE row_num = 1"
+
+tic()
+ccp_auto_download <- dbGetQuery(radar, query)
+toc()
+
+# Save raw download for backup
+write_csv(ccp_auto_download, "/shared/crt/AutoLoans/data/raw/CCPAutoSample100.csv")
+cat("CCP data downloaded and saved. Total records:", nrow(ccp_auto_download), "\n")
+```
+
+```{r ccp-data-processing}
+# Process CCP data for merging
+ccp_auto_download <- read_csv("/shared/crt/AutoLoans/data/raw/CCPAutoSample100.csv") %>%
+  readr::type_convert()
+
+ccp_auto <- ccp_auto_download %>%
+  select(cid, tlid, hicredit, payment, term, opendate, qtr, state, primary_flag_d) %>%
+  mutate(hicredit = floor(hicredit)) %>%
+  mutate(zero_payment = payment == 0) %>%
+  mutate(year = year(opendate),
+         month = month(opendate),
+         quarter = quarter(opendate)) %>%
+  add_count(hicredit, year, month, state, payment, name = "duplicate_count")
+
+# Clean up memory
+rm(ccp_auto_download)
+
+cat("CCP data processed. Final records:", nrow(ccp_auto), "\n")
+cat("Records with zero payments:", sum(ccp_auto$zero_payment), "\n")
+cat("Records with duplicates:", sum(ccp_auto$duplicate_count > 1), "\n")
+```
+
+### 2.1 CCP Data Deduplication
+
+```{r ccp-deduplication}
+# Deduplicate CCP (prefer primary sample when duplicates exist)
+ccp_clean <- ccp_auto %>%
+  arrange(year, month, hicredit, state, payment, desc(primary_flag_d)) %>%
+  distinct(year, month, hicredit, state, payment, .keep_all = TRUE)
+
+cat("=== CCP DEDUPLICATION ===\n")
+cat("Original CCP records:", nrow(ccp_auto), "\n")
+cat("After deduplication:", nrow(ccp_clean), "\n")
+cat("Records removed:", nrow(ccp_auto) - nrow(ccp_clean), "\n")
+
+# Check primary vs non-primary in final dataset
+primary_composition <- ccp_clean %>%
+  count(primary_flag_d) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+cat("\nFinal CCP composition:\n")
+print(primary_composition)
+```
+
+## Step 3: Initial ABS-CCP Data Merge
+
+```{r initial-merge}
+# Perform the initial merge (keeping ABS duplicates, using cleaned CCP data)
+match_abs_ccp_raw <- abs %>%
+  left_join(ccp_clean, by = c("year" = "year",
+                             "month" = "month",
+                             "originalLoanAmount" = "hicredit",
+                             "state" = "state", 
+                             "reportingPeriodScheduledPaymentAmount" = "payment")) %>%
+  mutate(match = !is.na(tlid)) %>%
+  group_by(assetNumber, assetTypeNumber) %>%
+  mutate(nobs_match = n()) %>%
+  ungroup() %>%
+  group_by(assetNumber, assetTypeNumber, match) %>%
+  mutate(pay_match = payment == reportingPeriodScheduledPaymentAmount,
+         nobs_pay = n()) %>%
+  ungroup()
+
+cat("=== INITIAL MERGE RESULTS ===\n")
+cat("Total ABS records:", nrow(abs), "\n")
+cat("Successfully matched:", sum(match_abs_ccp_raw$match), "\n")
+cat("Match rate:", round(mean(match_abs_ccp_raw$match) * 100, 2), "%\n")
+cat("Initial merged dataset size:", nrow(match_abs_ccp_raw), "\n")
+```
+
+## Step 4: Census Block Data Loading
+
+Need to find out exactly how I created this file
+
+Created at https://data2.nhgis.org/main
+
+Details of the query are in "/home/a1psw01/Projects/AutoLoans/Data/nhgis0005_ds172_2010_block_codebook.txt"
+
+"/home/a1psw01/Projects/AutoLoans/Data/nhgis0005_ds172_2010_block.csv"
+
+```{r census-block-data}
+# Load 2010 Census block-level demographic data
+block_download <- read_csv("/home/a1psw01/Projects/AutoLoans/Data/nhgis0005_ds172_2010_block.csv")
+
+block <- block_download %>%
+     select(TRACTA, BLOCKA, COUNTYA, STUSAB, starts_with("H7")) %>%
+     mutate(TRACTA = as.factor(TRACTA), 
+            BLOCKA = as.factor(BLOCKA), 
+            COUNTYA = as.factor(COUNTYA), 
+            STUSAB = as.factor(STUSAB))
+
+cat("Census block data loaded successfully. Total records:", nrow(block), "\n")
+cat("Variables included:", paste(names(block), collapse = ", "), "\n")
+```
+
+## Step 5: CCP Geographic Data Download
+
+```{r ccp-block-download, cache=TRUE}
+# Download geographic information for CCP auto loan borrowers
+radar <- dbConnect(odbc::odbc(), 'RADAR')
+
+query = "SELECT cid, qtr, hhid, census_block_2010, census_tract_2010, state, county_code_2010
+FROM concredit.view_join_static_dynamic_eqf  
+WHERE (cid, qtr) IN (
+    SELECT cid, qtr
+    FROM (
+        SELECT 
+            cid, 
+            qtr, 
+            ROW_NUMBER() OVER (PARTITION BY tlid ORDER BY qtr ASC) AS row_num
+        FROM concredit.view_autoloans 
+        WHERE opendate >= '2017-01-01'
+            AND opendate <= '2023-12-01'
+            AND qtr >= '2017-03-01'
+            AND qtr <= '2023-12-01'
+    ) AS ranked_data
+    WHERE row_num = 1
+);"
+
+tic()
+ccp_auto_block_download <- dbGetQuery(radar, query) %>%
+     arrange(cid)
+toc()
+
+# Save the geographic data
+write_csv(ccp_auto_block_download, "/shared/crt/AutoLoans/data/raw/ccp_auto_block_download.csv")
+
+cat("CCP geographic data downloaded successfully. Total records:", nrow(ccp_auto_block_download), "\n")
+cat("Geographic variables:", paste(names(ccp_auto_block_download), collapse = ", "), "\n")
+```
+
+## Step 6: Data Merge with Geographic Data
+
+```{r final-merge}
+# Load the CCP geographic data and perform final merge with demographic data
+ccp_auto_block_download <- read_csv("/shared/crt/AutoLoans/data/raw/ccp_block_download.csv")
+
+match_abs_ccp_block <- match_abs_ccp_raw %>%
+     left_join(ccp_auto_block_download) %>% 
+     mutate(census_block_2010 = as.factor(census_block_2010),
+            census_tract_2010 = as.factor(census_tract_2010),
+            state = as.factor(obligorGeographicLocation),
+            county_code_2010 = as.factor(county_code_2010)) %>%
+     left_join(block, by = c("census_block_2010" = "BLOCKA",
+                            "census_tract_2010" = "TRACTA",
+                            "state" = "STUSAB",
+                            "county_code_2010" = "COUNTYA"))
+
+cat("=== FINAL MERGE RESULTS ===\n")
+cat("Starting records:", nrow(match_abs_ccp_raw), "\n")
+cat("Records with geographic data:", sum(!is.na(match_abs_ccp_block$census_block_2010)), "\n")
+cat("Records with demographic data:", sum(!is.na(match_abs_ccp_block$H7X001)), "\n")
+cat("Final dataset size:", nrow(match_abs_ccp_block), "\n")
+```
+
+```{r export-final, eval=FALSE}
+# Export the final merged dataset with geographic and demographic data
+write_csv(match_abs_ccp_block, "/shared/crt/AutoLoans/data/intermediate/match_abs_ccp_block_final.csv")
+cat("Final merged dataset with geographic data exported successfully\n")
+```
+
+The final dataset (`match_abs_ccp_block`) contains ABS auto loan data merged with CCP credit data, filtered to unique matches, and enriched with census block demographic characteristics.
+
+## Step 7: CCP Mortgage Data Creation
+
+### 7.1 Pull Mortgages
+
+```{r mortgage-data-pull, cache=TRUE}
+# Pull mortgage tradeline data from CCP
+library(glue)
+
+radar <- dbConnect(odbc::odbc(), 'RADAR')
+
+query = glue::glue("WITH ranked_data AS (
+    SELECT 
+    cid, 
+    tlid, 
+    ecoacode, 
+    hicredit, 
+    industrycode, 
+    opendate, 
+    qtr, 
+    accounttype, 
+    tradeline_type_e, 
+    narrativecode1, 
+    narrativecode2, 
+    state, 
+    lastactivitydate,
+    MAX(lastactivitydate) OVER (PARTITION BY tlid) AS last_date,  
+    MIN(qtr) OVER (PARTITION BY tlid) AS min_qtr,  
+    MAX(qtr) OVER (PARTITION BY tlid) AS max_qtr,  
+    ROW_NUMBER() OVER (PARTITION BY tlid ORDER BY qtr ASC) AS row_num,
+    COUNT(*) OVER (PARTITION BY tlid) AS cnt
+FROM 
+    concredit.view_join_tradeline_consumer
+WHERE 
+    accounttype = 'I' 
+    AND tradeline_type_e = '1'
+)
+SELECT 
+    cid, tlid, ecoacode, hicredit, industrycode, opendate, qtr, accounttype, 
+    tradeline_type_e, last_date, min_qtr, max_qtr, narrativecode1, narrativecode2
+FROM 
+    ranked_data
+WHERE 
+    (cnt >= 3 AND row_num = 3)
+    OR (cnt < 3 AND row_num = cnt);
+")
+
+tic()
+ccp_mortgage_download <- dbGetQuery(radar, query)
+toc()
+
+cat("Mortgage data downloaded successfully. Total records:", nrow(ccp_mortgage_download), "\n")
+
+# Save the CCP mortgage download data
+write_csv(ccp_mortgage_download, "/shared/crt/AutoLoans/data/intermediate/ccp_mortgage_download.csv")
+cat("CCP mortgage download data saved successfully\n")
+cat("Records saved:", nrow(ccp_mortgage_download), "\n")
+
+```
+
+### 7.2 Merge in Geography
+
+```{r mortgage-geography-merge, cache=TRUE}
+ccp_mortgage_download <- read_csv("/shared/crt/AutoLoans/data/intermediate/ccp_mortgage_download.csv") %>%
+  readr::type_convert()
+
+# ccp_mortgage_download <- read_csv("/shared/crt/AutoLoans/data/intermediate/ccp_mortgage_download_sample.csv") %>%
+  # readr::type_convert()
+
+
+
+cat("CCP mortgage data loaded successfully\n")
+cat("Dimensions:", nrow(ccp_mortgage_download), "rows,", ncol(ccp_mortgage_download), "columns\n")
+
+# Memory-efficient approach - save each year separately then combine
+radar <- dbConnect(odbc::odbc(), 'RADAR')
+
+start_dates <- seq(as.Date("1999/3/1"), as.Date("2000/3/1"), by = "1 year")
+yearly_files <- c()
+
+for (ii in start_dates) {
+     ii_date <- as.Date(ii)
+     cat("\nProcessing year:", year(ii_date), "\n")
+     
+     # More restrictive query to reduce memory usage
+     query = paste0("SELECT 
+         cid, 
+         qtr, 
+         state,  
+         census_tract,  
+         county_code, 
+         census_tract_2010,  
+         county_code_2010, 
+         census_tract_2020,  
+         county_code_2020
+     FROM 
+         concredit.view_join_static_dynamic_eqf
+     WHERE 
+         cid IN (
+             SELECT 
+                 cid 
+             FROM 
+                 concredit.view_join_tradeline_consumer
+             WHERE 
+                 accounttype = 'I' 
+                 AND tradeline_type_e = '1'
+         )
+         AND qtr >= '", ii_date, "' 
+         AND qtr < '", ii_date %m+% years(1), "';")
+     
+     tic()
+     ccp_tracts <- dbGetQuery(radar, query)
+     toc()
+     
+     # Process this year's data
+     ccp_mortgage_year <- ccp_mortgage_download %>%
+          left_join(ccp_tracts) %>%
+          filter(!is.na(state))
+     
+     # Save this year separately
+     year_file <- paste0("/shared/crt/AutoLoans/data/temp/ccp_mortgage_", year(ii_date), ".csv")
+     write_csv(ccp_mortgage_year, year_file)
+     yearly_files <- c(yearly_files, year_file)
+     
+     # Clear memory
+     rm(ccp_tracts, ccp_mortgage_year)
+     gc()
+     
+     cat("Year", year(ii_date), "completed and saved\n")
+}
+
+# Now combine all yearly files
+cat("Combining all years...\n")
+ccp_mortgage <- map_dfr(yearly_files, read_csv)
+
+# Save final combined file
+write_csv(ccp_mortgage, "/shared/crt/AutoLoans/data/raw/ccp_mortgage.csv")
+
+# Clean up temporary files
+# file.remove(yearly_files)
+
+cat("Mortgage data with geography completed. Total records:", nrow(ccp_mortgage), "\n")
+```
+
+### 7.3 CCP Mortgage Data Processing
+
+```{r mortgage-data-processing}
+# Load and process CCP mortgage data for merging with HMDA
+# ccp_mortgage <- read_csv("/shared/crt/AutoLoans-/data/raw/ccp_mortgage.csv")
+
+# State abbreviation to FIPS code concordance
+state_fips_concordance <- c(
+  "AL" = "01", "AK" = "02", "AZ" = "04", "AR" = "05", "CA" = "06", "CO" = "08", "CT" = "09", "DE" = "10", 
+  "DC" = "11", "FL" = "12", "GA" = "13", "HI" = "15", "ID" = "16", "IL" = "17", "IN" = "18", "IA" = "19", 
+  "KS" = "20", "KY" = "21", "LA" = "22", "ME" = "23", "MD" = "24", "MA" = "25", "MI" = "26", "MN" = "27", 
+  "MS" = "28", "MO" = "29", "MT" = "30", "NE" = "31", "NV" = "32", "NH" = "33", "NJ" = "34", "NM" = "35", 
+  "NY" = "36", "NC" = "37", "ND" = "38", "OH" = "39", "OK" = "40", "OR" = "41", "PA" = "42", "RI" = "44", 
+  "SC" = "45", "SD" = "46", "TN" = "47", "TX" = "48", "UT" = "49", "VT" = "50", "VA" = "51", "WA" = "53", 
+  "WV" = "54", "WI" = "55", "WY" = "56"
+)
+
+match_abs_ccp_block <- read_csv("/shared/crt/AutoLoans/data/intermediate/match_abs_ccp_block_final.csv") %>%
+  readr::type_convert()
+
+# Get list of CIDs from auto loan sample to filter mortgage data
+abs_cid_list <- match_abs_ccp_block %>% 
+     select(cid) %>% distinct()
+
+# Process mortgage data for HMDA merge
+ccp_mortgage_merge <- ccp_mortgage %>%
+     filter(cid %in% abs_cid_list$cid) %>%
+     mutate(state_code = state_fips_concordance[state]) %>%
+     mutate(census_tract = ifelse(census_tract == "000000", NA, census_tract)) %>%
+     mutate(coborrower = ecoacode == "J" | ecoacode == "S") %>%
+     mutate(purchaser = ifelse(narrativecode1 == 208 | narrativecode2 == 208, "fnma",
+                              ifelse(narrativecode1 == 218 | narrativecode2 == 218, "fhlmc",
+                                    ifelse(narrativecode1 == 150 | narrativecode2 == 150 | 
+                                          narrativecode1 == 151 | narrativecode2 == 151, "gnma",
+                                          "none")))) %>%
+     mutate(openyear = substr(opendate, 1, 4), 
+            openmonth = substr(opendate, 5, 6)) %>%
+     mutate(open_date = as.Date(paste0(substr(opendate, 1, 4), "-", 
+                                      substr(opendate, 5, 6), "-01"), format = "%Y-%m-%d")) %>%
+     # Assign appropriate census tract based on date (different vintages)
+     mutate(c_tract = ifelse(open_date > as.Date("2022/12/1"), census_tract_2020,
+                            ifelse(open_date > as.Date("2014/6/1"), census_tract_2010, census_tract))) %>%
+     mutate(c_county = ifelse(open_date > as.Date("2022/12/1"), county_code_2020,
+                             ifelse(open_date > as.Date("2014/6/1"), county_code_2010, county_code))) %>%
+     # Round loan amounts for pre-2018 data
+     mutate(hicredit = ifelse(openyear < 2018, 1000 * round(hicredit / 1000), hicredit)) %>%
+     arrange(open_date) %>%
+     relocate(cid, tlid, openmonth, openyear, c_county, c_tract, state_code, hicredit) %>%
+     mutate(c_tract = as.factor(c_tract),
+            c_county = as.factor(c_county),
+            state_code = as.factor(state_code),
+            openmonth = as.factor(openmonth),
+            openyear = as.factor(openyear))
+
+cat("Mortgage data processed for HMDA merge. Records:", nrow(ccp_mortgage_merge), "\n")
+cat("CIDs with mortgage data:", n_distinct(ccp_mortgage_merge$cid), "\n")
+```
+
+## Step 8: HMDA Data Download
+
+Note that this part of NAMS Request 31185 which is good through 2026/04/30
+
+```{r hmda-download, cache=TRUE}
+# Download HMDA data across different time periods (data structure changes over time)
+radar <- dbConnect(odbc::odbc(), 'RADAR')
+
+# 1998-2000: Pre-2004 queries (no LIEN_STATUS variable prior to 2004)
+query_1998_2000 <- "
+          SELECT action_date,year,action_type,applicant_age,agency_code,
+applicant_race_1,applicant_race_pre2004,
+applicant_ethnicity,coapplicant_ethnicity,
+county_code,state_code,census_tract,
+lien_status,loan_amount,loan_purpose,loan_type,occupancy
+FROM chmda.view_lar_chmda WHERE (action_type=1  AND occupancy=1 AND year>=1998 AND year<2001)
+          "
+
+tic()
+hmda_download_1998_2000 <- dbGetQuery(radar, query_1998_2000)
+toc()
+write_csv(hmda_download_1998_2000, "/shared/crt/AutoLoans/data/raw/hmda_download_1998_2000.csv")
+cat("HMDA 1998-2000 downloaded:", nrow(hmda_download_1998_2000), "records\n")
+
+# 2004-2009: Include lien_status filter
+query_2004_2009 <- "
+          SELECT action_date,year,action_type,applicant_age,agency_code,
+applicant_race_1,applicant_race_pre2004,
+applicant_ethnicity,coapplicant_ethnicity,
+county_code,state_code,census_tract,
+lien_status,loan_amount,loan_purpose,loan_type,occupancy
+FROM chmda.view_lar_chmda WHERE (action_type=1 AND lien_status=1 AND occupancy=1 AND year>=2004 AND year<2010)
+          "
+
+tic()
+hmda_download_2004_2009 <- dbGetQuery(radar, query_2004_2009) %>%
+     filter(lien_status == 1)
+toc()
+write_csv(hmda_download_2004_2009, "/shared/crt/AutoLoans/data/raw/hmda_download_2004_2009.csv")
+cat("HMDA 2004-2009 downloaded:", nrow(hmda_download_2004_2009), "records\n")
+
+# 2010-2017: Continue with lien_status filter
+query_2010_2017 <- "
+          SELECT action_date,year,action_type,applicant_age,agency_code,
+applicant_race_1,applicant_race_pre2004,
+applicant_ethnicity,coapplicant_ethnicity,
+county_code,state_code,census_tract,
+lien_status,loan_amount,loan_purpose,loan_type,occupancy
+FROM chmda.view_lar_chmda WHERE (action_type=1 AND lien_status=1 AND occupancy=1 AND year>=2010 AND year<2018)
+          "
+
+tic()
+hmda_download_2010_2017 <- dbGetQuery(radar, query_2010_2017)
+toc()
+write_csv(hmda_download_2010_2017, "/shared/crt/AutoLoans/data/raw/hmda_download_2010_2017.csv")
+cat("HMDA 2010-2017 downloaded:", nrow(hmda_download_2010_2017), "records\n")
+
+# 2018+: Most recent data structure
+query_2018_plus <- "
+          SELECT action_date,year,action_type,applicant_age,agency_code,
+applicant_race_1,applicant_race_pre2004,
+applicant_ethnicity,coapplicant_ethnicity,
+county_code,state_code,census_tract,
+lien_status,loan_amount,loan_purpose,loan_type,occupancy
+FROM chmda.view_lar_chmda WHERE (action_type=1 AND lien_status=1 AND occupancy=1 AND year>=2018 )
+          "
+
+tic()
+hmda_download_2018_plus <- dbGetQuery(radar, query_2018_plus)
+toc()
+write_csv(hmda_download_2018_plus, "/shared/crt/AutoLoans/data/raw/hmda_download_2018_plus.csv")
+cat("HMDA 2018+ downloaded:", nrow(hmda_download_2018_plus), "records\n")
+
+cat("All HMDA data downloads completed successfully\n")
+```
+
+### 8.1 HMDA Data Processing
+
+```{r hmda-data-processing}
+# Load and process HMDA data for merging with CCP mortgage data
+
+# Process 2018+ HMDA data
+hmda_download_2018_plus <- read_csv("/shared/crt/AutoLoans/data/raw/hmda_download_2018_plus.csv")
+
+hmda_download_2018_plus_merge <- hmda_download_2018_plus %>%
+     mutate(actionyear = substr(action_date, 1, 4), 
+            actionmonth = substr(action_date, 5, 6)) %>%
+     mutate(census_tract = gsub("\\.", "", census_tract)) %>%
+     # Adjust loan amounts: multiply by 1000 for pre-2020 data
+     mutate(loan_amount = ifelse(year < 2020, round(loan_amount * 1000), loan_amount)) %>%
+     mutate(census_tract = as.factor(census_tract),
+            county_code = as.factor(county_code),
+            state_code = as.factor(state_code),
+            actionmonth = as.factor(actionmonth),
+            actionyear = as.factor(actionyear))
+
+cat("HMDA 2018+ processed:", nrow(hmda_download_2018_plus_merge), "records\n")
+
+# Process 2010-2017 HMDA data
+hmda_download_2010_2017 <- read_csv("/shared/crt/AutoLoans/data/raw/hmda_download_2010_2017.csv")
+
+hmda_download_2010_2017_merge <- hmda_download_2010_2017 %>%
+     mutate(actionyear = substr(action_date, 1, 4), 
+            actionmonth = substr(action_date, 5, 6)) %>%
+     mutate(census_tract = gsub("\\.", "", census_tract)) %>%
+     # Multiply all loan amounts by 1000 for this period
+     mutate(loan_amount = loan_amount * 1000) %>%
+     mutate(census_tract = as.factor(census_tract),
+            county_code = as.factor(county_code),
+            state_code = as.factor(state_code),
+            actionmonth = as.factor(actionmonth),
+            actionyear = as.factor(actionyear))
+
+cat("HMDA 2010-2017 processed:", nrow(hmda_download_2010_2017_merge), "records\n")
+
+# Combine HMDA datasets
+hmda_combined <- rbind(hmda_download_2010_2017_merge, hmda_download_2018_plus_merge)
+
+cat("Combined HMDA dataset created:", nrow(hmda_combined), "records\n")
+cat("Years covered:", min(hmda_combined$year), "to", max(hmda_combined$year), "\n")
+
+write_csv(hmda_combined, "/shared/crt/AutoLoans/data/intermediate/hmda_combined.csv")
+cat("HMDA combined dataset saved successfully\n")
+```
+
+## Step 9: Final CCP-HMDA Merge 
+```{r final-ccp-hmda-merge}
+# Merge CCP mortgage data with HMDA data to obtain race/ethnicity information
+ccp_hmda_merge_raw <- ccp_mortgage_merge %>% 
+     left_join(hmda_combined, by = c("openyear" = "actionyear",
+                                    "openmonth" = "actionmonth",
+                                    "c_tract" = "census_tract",
+                                    "c_county" = "county_code",
+                                    "state_code" = "state_code",
+                                    "hicredit" = "loan_amount"),
+               keep = TRUE) %>%
+     relocate(hicredit, loan_amount)
+
+cat("CCP-HMDA merge completed:", nrow(ccp_hmda_merge_raw), "records\n")
+cat("Records with HMDA match:", sum(!is.na(ccp_hmda_merge_raw$applicant_race_1)), "\n")
+
+# Process merged data to create clean race/ethnicity assignments
+ccp_hmda_merge <- ccp_hmda_merge_raw %>% 
+     filter(!is.na(applicant_race_1)) %>%
+     filter(applicant_race_1 < 6, applicant_ethnicity < 3) %>%
+     group_by(tlid) %>%
+     mutate(nobs = n()) %>% 
+     ungroup() %>%
+     filter(nobs == 1) %>% 
+     select(cid, tlid, applicant_race_1, applicant_ethnicity, coapplicant_ethnicity) %>%
+     group_by(cid) %>%
+     summarize(all_equal_race = n_distinct(applicant_race_1) == 1,
+               all_equal_ethnicity = n_distinct(applicant_ethnicity) == 1,
+               race = mean(applicant_race_1),
+               ethnicity = mean(applicant_ethnicity),
+               .groups = 'drop') %>%
+     filter(all_equal_race == TRUE, all_equal_ethnicity == TRUE) %>%
+     mutate(race_eth_hmda = case_when(race == 5 & ethnicity == 2 ~ "nhw",
+                                     race == 5 & ethnicity == 1 ~ "hw",
+                                     race == 3 ~ "black",
+                                     race == 2 ~ "asian",
+                                     TRUE ~ "other")) %>%
+     mutate(race_eth_hmda = relevel(factor(race_eth_hmda), ref = "nhw")) %>%
+     select(cid, race_eth_hmda)
+
+cat("Clean race/ethnicity assignments created for", nrow(ccp_hmda_merge), "borrowers\n")
+```
+
+## Step 10: Final CCP-ABS
+
+```{r}
+match_abs_ccp_block <- read_csv("/shared/crt/AutoLoans/data/intermediate/match_abs_ccp_block_final.csv") %>%
+  readr::type_convert()
+
+# Create final analytical dataset
+abs_hmda_sample <- match_abs_ccp_block %>%
+     left_join(ccp_hmda_merge) %>%
+     # Calculate census block race/ethnicity percentages
+     mutate(across(starts_with("H7X00"), 
+                   ~ . / H7X001, 
+                   .names = "{.col}_pct")) %>%
+     mutate(across(starts_with("H7Z0"), 
+                   ~ . / H7Z001, 
+                   .names = "{.col}_pct")) %>%
+     # Create race/ethnicity indicators based on census block demographics
+     mutate(bin3 = cut(H7X003_pct, breaks = seq(0, 1, by = 0.1))) %>%
+     mutate(yearmonth = as.Date(paste0(year, "/", month, "/1"))) %>%
+     mutate(race_eth_block = case_when(H7Z003_pct > 0.85 ~ "nhw",
+                                      H7Z011_pct > 0.85 ~ "hw",
+                                      H7X003_pct > 0.85 ~ "black",
+                                      TRUE ~ "other")) %>%
+     mutate(race_eth_block = relevel(factor(race_eth_block), ref = "nhw")) %>%
+     # Additional loan characteristics
+     mutate(new = vehicleNewUsedCode == 1) %>%
+     mutate(ltv = originalLoanAmount / vehicleValueAmount) %>%
+     relocate(assetTypeNumber, assetNumber, originalInterestRatePercentage, 
+              originalLoanTerm, race_eth_block, race_eth_hmda)
+
+# Export final analytical dataset
+write_csv(abs_hmda_sample, "/shared/crt/AutoLoans/data/intermediate/abs_hmda_sample.csv")
+
+cat("=== FINAL DATASET SUMMARY ===\n")
+cat("Total auto loan records:", nrow(abs_hmda_sample), "\n")
+cat("Records with HMDA-based race/ethnicity:", sum(!is.na(abs_hmda_sample$race_eth_hmda)), "\n")
+cat("Records with census block demographics:", sum(!is.na(abs_hmda_sample$H7X001)), "\n")
+cat("Final analytical dataset exported successfully\n")
+```
